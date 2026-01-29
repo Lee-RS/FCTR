@@ -1,0 +1,135 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FCTR(nn.Module):
+    """
+    Frequency–Covariance Token Rectifier (FCTR)
+
+    Implements the FCTR module as described:
+      1) 1D FFT along the channel dimension for each token
+      2) Magnitude spectrum -> centered -> covariance across channels
+      3) Covariance normalization (trace-normalized)
+      4) Pool covariance -> generate channel-wise modulation gate (sigmoid)
+      5) Modulate complex spectrum -> iFFT -> residual rectification
+
+    Expected input:
+      - tokens: (B, N, C) or (N, C)
+        B: batch size
+        N: number of tokens
+        C: embedding dimension (channel dimension)
+
+    Output:
+      - rectified tokens with same shape as input
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6, gate_bias: float = 0.0):
+        """
+        Args:
+            dim: token embedding dimension C
+            eps: numerical stability constant
+            gate_bias: optional bias added before sigmoid (can be 0.0 by default)
+        """
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+
+        # A lightweight transform to map pooled covariance statistics -> modulation gate
+        # (matches the idea of "lightweight transformation" with learnable parameters)
+        self.fc = nn.Linear(dim, dim, bias=True)
+
+        # Optional: initialize bias to a small value if desired (kept neutral by default)
+        nn.init.constant_(self.fc.bias, gate_bias)
+
+    @staticmethod
+    def _ensure_3d(tokens: torch.Tensor):
+        """Allow input as (N,C) or (B,N,C). Returns (B,N,C) and a flag to restore shape."""
+        if tokens.dim() == 2:
+            return tokens.unsqueeze(0), True
+        if tokens.dim() == 3:
+            return tokens, False
+        raise ValueError(f"FCTR expects tokens with shape (N,C) or (B,N,C), got {tuple(tokens.shape)}")
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Args:
+            tokens: Tensor of shape (B,N,C) or (N,C)
+
+        Returns:
+            Tensor with same shape as input.
+        """
+        x, squeeze_batch = self._ensure_3d(tokens)  # (B,N,C)
+        B, N, C = x.shape
+        assert C == self.dim, f"Input dim C={C} does not match initialized dim={self.dim}"
+
+        # -----------------------------
+        # 1) Frequency-domain projection
+        # -----------------------------
+        # Apply FFT along channel dimension (last dim) for each token
+        # Complex-valued: (B,N,C) complex
+        x_freq = torch.fft.fft(x, dim=-1)
+
+        # Magnitude spectrum: real, (B,N,C)
+        mag = torch.abs(x_freq)
+
+        # -----------------------------
+        # 2) Frequency covariance modeling
+        # -----------------------------
+        # Center across token dimension (N): per batch and per channel
+        # mean over tokens -> (B,1,C)
+        mag_mean = mag.mean(dim=1, keepdim=True)
+        mag_centered = mag - mag_mean  # (B,N,C)
+
+        # Covariance across channels: (B,C,C)
+        # Σ = (A^T A) / (N-1) where A is (N,C)
+        # Use batch matmul: (B,C,N) @ (B,N,C) -> (B,C,C)
+        denom = max(N - 1, 1)  # avoid division by 0 when N=1
+        cov = torch.bmm(mag_centered.transpose(1, 2), mag_centered) / float(denom)  # (B,C,C)
+
+        # -----------------------------
+        # 3) Covariance normalization
+        # -----------------------------
+        # Trace normalization for scale invariance / stability
+        # tr(cov): (B,)
+        tr = cov.diagonal(dim1=-2, dim2=-1).sum(dim=-1)  # (B,)
+        cov_norm = cov / (tr.view(B, 1, 1) + self.eps)
+
+        # -----------------------------
+        # 4) Generate modulation gate
+        # -----------------------------
+        # Pool covariance -> channel descriptor (B,C)
+        # Row-wise average: mean over last dim -> (B,C)
+        desc = cov_norm.mean(dim=-1)
+
+        # Lightweight transformation + sigmoid gating: (B,C) in (0,1)
+        gate = torch.sigmoid(self.fc(desc))  # (B,C)
+
+        # Broadcast to (B,N,C) and modulate complex spectrum
+        gate_bc = gate.unsqueeze(1)  # (B,1,C)
+        x_freq_mod = x_freq * gate_bc  # complex modulation (B,N,C)
+
+        # -----------------------------
+        # 5) iFFT back + residual rectification
+        # -----------------------------
+        x_rect = torch.fft.ifft(x_freq_mod, dim=-1).real  # take real part (B,N,C)
+
+        out = x + x_rect  # residual rectification
+
+        if squeeze_batch:
+            out = out.squeeze(0)  # back to (N,C)
+        return out
+
+
+# -----------------------------
+# Minimal usage example
+# -----------------------------
+if __name__ == "__main__":
+    B, N, C = 2, 256, 96
+    tokens = torch.randn(B, N, C)
+
+    fctr = FCTR(dim=C)
+    out = fctr(tokens)
+
+    print("Input:", tokens.shape, "Output:", out.shape)
